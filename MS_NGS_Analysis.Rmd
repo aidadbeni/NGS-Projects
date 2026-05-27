@@ -1,0 +1,859 @@
+---
+title: "Multiple Sclerosis (MS): Transcriptomic Changes After Treatment"
+author: "Aida Davoudian Beni, Sara Ashna"
+date: "2026-05-07"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+# Global chunk options: show code, suppress warnings/messages, set figure size
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6
+)
+```
+
+# Introduction
+
+This analysis investigates transcriptomic differences between pre-treatment and
+post-treatment samples from Multiple Sclerosis (MS) patients using the RNA-seq
+dataset **SRP045500**. The pipeline covers:
+
+1. Data loading and metadata preparation
+2. Exploratory data analysis and quality control
+3. Gene filtering
+4. Normalization and GC-bias correction
+5. Principal component analysis (PCA)
+6. Differential expression analysis (DESeq2 and edgeR)
+7. Heatmap of top shared DEGs
+8. Functional enrichment analysis (ORA and GSEA)
+
+---
+```{r}
+# Create figures directory
+if (!dir.exists("figures")) {
+  dir.create("figures")
+}
+```
+
+# Library Loading
+
+```{r libraries}
+# Core Bioconductor packages
+library(DESeq2)
+library(SummarizedExperiment)
+library(EDASeq)
+library(edgeR)
+library(biomaRt)
+library(limma)
+library(pheatmap)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ReactomePA)
+library(enrichplot)
+
+# Tidyverse and utility packages
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(gridExtra)
+library(plyr)
+library(corrplot)
+library(ggfortify)
+library(ggrepel)
+```
+
+---
+
+# Data Loading and Metadata Preparation
+
+```{r data-loading, results='hide'}
+# Load the SRP045500 SummarizedExperiment object
+data <- readRDS("/opt/omicsdata/datasets/SRP045500.rds")
+
+# Inspect the metadata column names and sample attributes
+colnames(colData(data))
+attr <- colData(data)$sra.sample_attributes
+
+# Count pre- and post-treatment samples
+sum(grepl("posttreatment", attr))
+sum(grepl("pretreatment",  attr))
+
+# Assign treatment labels based on attribute strings
+treatment <- ifelse(
+  grepl("posttreatment", attr), "post",
+  ifelse(grepl("pretreatment", attr), "pre", NA)
+)
+
+# Extract cell type information from sample attributes
+colData(data)$celltype <- sub(".*celltype;;([^|;]+).*", "\\1", attr)
+
+# Subset to pre- and post-treatment samples only (remove NAs)
+keep       <- !is.na(treatment)
+data_ms    <- data[, keep]
+treatment_ms <- treatment[keep]
+
+# Store treatment labels in the SummarizedExperiment metadata
+colData(data_ms)$treatment <- treatment_ms
+```
+
+---
+
+# Exploratory Data Analysis and Quality Control
+
+## Raw Count Distribution
+
+```{r raw-count-boxplot}
+# Extract raw count matrix
+raw_count <- assay(data_ms, "raw_counts")
+
+# Colour samples by treatment group
+col <- ifelse(treatment_ms == "post", "purple", "steelblue")
+
+# Boxplot of log2-transformed raw counts — shows per-sample expression spread
+boxplot(
+  log2(raw_count + 1),
+  col      = col,
+  las      = 2,
+  cex.axis = 0.5,
+  ylab     = "log2(counts + 1)",
+  main     = "Raw count distribution (log2 scale)"
+)
+legend("topright", legend = c("post", "pre"), fill = c("purple", "steelblue"))
+ggsave("figures/01_raw_counts_boxplot.png", width = 12, height = 6, dpi = 300)
+```
+
+## MA Plot (Raw Counts)
+
+```{r ma-plot}
+# MA plot: M = log2(sample / virtual reference), A = average log expression
+# Ideally, most genes should centre around M = 0 (no overall fold change)
+limma::plotMA(
+  log1p(raw_count),
+  main = "MA Plot — MS raw counts",
+  xlab = "Average log expression",
+  ylab = "M = log2(sample / reference)"
+)
+ggsave("figures/MA_Plot.png", width = 12, height = 6, dpi = 300)
+
+```
+
+## MD Plot (One Post vs One Pre Sample)
+
+```{r md-plot}
+# Compare the first post-treatment sample against the first pre-treatment sample
+post_idx <- which(treatment_ms == "post")[1]
+pre_idx  <- which(treatment_ms == "pre")[1]
+
+MDPlot(raw_count, c(post_idx, pre_idx))
+title(main = "MD Plot: one post vs one pre sample")
+ggsave("figures/MD_Plot.png", width = 12, height = 6, dpi = 300)
+
+```
+
+---
+
+# Gene Filtering
+
+```{r filtering}
+# Dimensions before filtering
+cat("Dimensions before filtering:\n")
+dim(data_ms)
+
+# Remove lowly expressed genes: keep genes with total counts >= 10
+data_ms_filt <- data_ms[rowSums(assay(data_ms)) >= 10, ]
+raw_count_ms <- assay(data_ms_filt)   # filtered count matrix
+
+# Dimensions after filtering
+cat("\nDimensions after filtering:\n")
+dim(data_ms_filt)
+cat("Genes removed:", nrow(data_ms) - nrow(data_ms_filt), "\n")
+```
+
+---
+
+# Principal Component Analysis (PCA) — Raw Counts
+
+```{r pca-raw-summary}
+# PCA on log-transformed raw counts (unfiltered) to assess overall structure
+pca <- prcomp(t(log1p(raw_count)))
+
+# Variance explained by the first 20 PCs
+cat("Variance explained by first 20 PCs:\n")
+print(summary(pca)$importance[, 1:20])
+```
+
+```{r pca-vst}
+# Build DESeq2 object from FILTERED data for VST-based PCA
+dds <- DESeqDataSet(data_ms_filt, design = ~ treatment)
+dds$treatment <- relevel(factor(dds$treatment), ref = "pre")
+
+# Variance Stabilising Transformation (blind = TRUE for exploratory QC)
+vsd <- vst(dds, blind = TRUE)
+
+# PCA on VST-transformed data; samples are rows after transposition
+pca_full    <- prcomp(t(assay(vsd)))
+pca_df      <- as.data.frame(pca_full$x[, 1:4])
+pca_df$treatment <- treatment_ms
+
+# Percentage of variance explained by each PC
+percentVar_full <- round(100 * summary(pca_full)$importance[2, 1:4], 1)
+
+# Screeplot — helps decide how many PCs capture meaningful variation
+screeplot(pca_full, type = "lines", main = "Variance explained by each PC")
+
+# Three pairwise PC comparison plots
+p1 <- ggplot(pca_df, aes(PC1, PC2, color = treatment)) +
+  geom_point(size = 3) + stat_ellipse(type = "t", level = 0.95) +
+  scale_color_manual(values = c("post" = "purple", "pre" = "steelblue")) +
+  xlab(paste0("PC1: ", percentVar_full[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar_full[2], "% variance")) +
+  ggtitle("PC1 vs PC2") + theme_bw()
+
+p2 <- ggplot(pca_df, aes(PC1, PC3, color = treatment)) +
+  geom_point(size = 3) + stat_ellipse(type = "t", level = 0.95) +
+  scale_color_manual(values = c("post" = "purple", "pre" = "steelblue")) +
+  xlab(paste0("PC1: ", percentVar_full[1], "% variance")) +
+  ylab(paste0("PC3: ", percentVar_full[3], "% variance")) +
+  ggtitle("PC1 vs PC3") + theme_bw()
+
+p3 <- ggplot(pca_df, aes(PC2, PC3, color = treatment)) +
+  geom_point(size = 3) + stat_ellipse(type = "t", level = 0.95) +
+  scale_color_manual(values = c("post" = "purple", "pre" = "steelblue")) +
+  xlab(paste0("PC2: ", percentVar_full[2], "% variance")) +
+  ylab(paste0("PC3: ", percentVar_full[3], "% variance")) +
+  ggtitle("PC2 vs PC3") + theme_bw()
+
+grid.arrange(p1, p2, p3, ncol = 3)
+# 02-04 - Individual PCA plots
+ggsave("figures/02_pca_pc1_pc2.png", p1, width = 8, height = 6, dpi = 300)
+ggsave("figures/03_pca_pc1_pc3.png", p2, width = 8, height = 6, dpi = 300)
+ggsave("figures/04_pca_pc2_pc3.png", p3, width = 8, height = 6, dpi = 300)
+
+# 05 - Combined PCA
+combined_pca <- grid.arrange(p1, p2, p3, ncol = 3)
+ggsave("figures/05_pca_combined.png", combined_pca, width = 18, height = 6, dpi = 300)
+```
+
+---
+
+# Normalization and Bias Correction
+
+## RLE Plot (Raw Counts)
+
+```{r rle-raw}
+# Relative Log Expression (RLE) plot on raw counts.
+# Boxes should ideally be centred at 0; any offset indicates normalization need.
+plotRLE(
+  raw_count_ms,
+  outline = FALSE, las = 2,
+  ylab = "RLE", main = "RLE of raw counts", col = col
+)
+```
+
+## GC-Content Bias Correction (EDASeq)
+
+```{r gc-bias-correction}
+# Connect to Ensembl and retrieve GC content and gene length for all genes
+mart         <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+gene_ids_original <- rownames(raw_count_ms)
+gene_ids_clean    <- sub("\\..*", "", gene_ids_original)   # strip version suffixes
+
+gene_info <- getBM(
+  attributes = c("ensembl_gene_id", "percentage_gene_gc_content",
+                 "start_position", "end_position"),
+  filters    = "ensembl_gene_id",
+  values     = gene_ids_clean,
+  mart       = mart
+)
+gene_info$length <- gene_info$end_position - gene_info$start_position
+
+# Remove duplicate Ensembl IDs and align to count matrix
+gene_info_unique <- gene_info[!duplicated(gene_info$ensembl_gene_id), ]
+found_in_ensembl <- gene_ids_clean %in% gene_info_unique$ensembl_gene_id
+counts_gc        <- raw_count_ms[found_in_ensembl, ]
+kept_clean_ids   <- gene_ids_clean[found_in_ensembl]
+
+keep_unique          <- !duplicated(kept_clean_ids)
+counts_gc_dedup      <- counts_gc[keep_unique, ]
+kept_clean_ids_dedup <- kept_clean_ids[keep_unique]
+match_idx_dedup      <- match(kept_clean_ids_dedup, gene_info_unique$ensembl_gene_id)
+gene_info_dedup      <- gene_info_unique[match_idx_dedup, ]
+rownames(counts_gc_dedup) <- kept_clean_ids_dedup
+
+# Build SeqExpressionSet with GC content (as percentage 0–100) and gene length
+featuredata <- data.frame(
+  gc     = gene_info_dedup$percentage_gene_gc_content,
+  length = gene_info_dedup$length,
+  row.names = kept_clean_ids_dedup
+)
+
+phenodata <- data.frame(
+  treatment = treatment_ms,
+  row.names = colnames(counts_gc_dedup)
+)
+
+set_ms <- newSeqExpressionSet(
+  counts      = as.matrix(counts_gc_dedup),
+  featureData = AnnotatedDataFrame(featuredata),
+  phenoData   = AnnotatedDataFrame(phenodata)
+)
+
+# Drop genes with missing GC content
+set_ms <- set_ms[!is.na(fData(set_ms)$gc), ]
+
+# GC bias plot BEFORE normalization
+colbias <- ifelse(treatment_ms == "post", "purple", "steelblue")
+biasPlot(set_ms, "gc", log = TRUE, ylim = c(0, 20),
+         col = colbias, main = "GC bias BEFORE normalization")
+
+# withinLaneNormalization requires GC as a proportion (0–1)
+fData(set_ms)$gc <- fData(set_ms)$gc / 100
+wt_ms <- withinLaneNormalization(set_ms, "gc", which = "full", offset = FALSE)
+
+# Convert GC back to percentage for the post-normalization bias plot
+fData(wt_ms)$gc <- fData(wt_ms)$gc * 100
+biasPlot(wt_ms, "gc", log = TRUE, ylim = c(0, 20),
+         col = colbias, main = "GC bias AFTER normalization")
+```
+
+## Between-Sample Normalization
+
+```{r between-sample-norm}
+# Between-lane (between-sample) normalization using EDASeq
+set_full <- betweenLaneNormalization(wt_ms, which = "full", offset = FALSE)
+
+# Extract the within-lane normalized counts for edgeR comparisons
+raw_count_norm <- counts(wt_ms)
+
+# Apply additional edgeR normalization methods for comparison
+nf_tmm <- calcNormFactors(raw_count_norm, method = "TMM")
+tmm    <- cpm(raw_count_norm, lib.size = nf_tmm * colSums(raw_count_ms))
+
+nf_rle <- calcNormFactors(raw_count_norm, method = "RLE")
+rle    <- cpm(raw_count_norm, lib.size = nf_rle * colSums(raw_count_ms))
+
+nf_uq  <- calcNormFactors(raw_count_norm, method = "upperquartile")
+uq     <- cpm(raw_count_norm, lib.size = nf_uq  * colSums(raw_count_ms))
+
+# Total count normalization (library-size CPM)
+tc <- cpm(raw_count_norm)
+```
+
+## Boxplots: Comparing Normalization Methods
+
+```{r norm-boxplots, fig.height=8}
+# Side-by-side log2 boxplots for each normalization method.
+# Well-normalized samples should show aligned medians.
+par(mfrow = c(2, 3), mar = c(3, 4, 3, 1))
+ylim_shared <- c(0, 10)
+
+boxplot(log2(raw_count_norm + 1), outline = FALSE, las = 2, col = col,
+        ylab = "log2(count+1)", main = "Before normalization",
+        xaxt = "n", ylim = ylim_shared)
+
+boxplot(log2(tc + 1), outline = FALSE, las = 2, col = col,
+        ylab = "log2(count+1)", main = "Total count",
+        xaxt = "n", ylim = ylim_shared)
+
+boxplot(log2(rle + 1), outline = FALSE, las = 2, col = col,
+        ylab = "log2(count+1)", main = "RLE",
+        xaxt = "n", ylim = ylim_shared)
+
+boxplot(log2(tmm + 1), outline = FALSE, las = 2, col = col,
+        ylab = "log2(count+1)", main = "TMM",
+        xaxt = "n", ylim = ylim_shared)
+
+boxplot(log2(uq + 1), outline = FALSE, las = 2, col = col,
+        ylab = "log2(count+1)", main = "Upper quartile",
+        xaxt = "n", ylim = ylim_shared)
+
+par(mfrow = c(1, 1))
+legend("topright", legend = c("post", "pre"),
+       fill = c("purple", "steelblue"), border = NA, bty = "n", cex = 0.9)
+```
+
+## RLE Plots After Normalization
+
+```{r rle-post-norm}
+# Compare RLE spread before and after normalization.
+# Good normalization compresses boxes toward zero with consistent spread.
+par(mfrow = c(1, 3))
+
+EDASeq::plotRLE(raw_count_norm, outline = FALSE, las = 2, col = col,
+                ylab = "RLE", main = "RLE — Raw", xaxt = "n")
+
+EDASeq::plotRLE(tmm, outline = FALSE, las = 2, col = col,
+                ylab = "RLE", main = "RLE — TMM", xaxt = "n")
+
+EDASeq::plotRLE(rle, outline = FALSE, las = 2, col = col,
+                ylab = "RLE", main = "RLE — RLE norm.", xaxt = "n")
+
+par(mfrow = c(1, 1))
+```
+
+## Sample Correlation Heatmap (TMM)
+
+```{r correlation-plot}
+# Pearson correlation matrix on log-TMM values, clustered by similarity.
+# High intra-group correlation (post-post, pre-pre) is expected.
+colnames_orig <- colnames(tmm)
+colnames(tmm) <- substr(colnames(tmm), 9, 12)   # shorten labels for readability
+m <- cor(log1p(tmm))
+corrplot(m, method = "color", order = "hclust", tl.cex = 0.2,
+         main = "Sample correlation — TMM")
+colnames(tmm) <- colnames_orig   # restore original column names
+```
+
+## PCA After Normalization
+
+```{r pca-norm}
+# PCA on three normalization strategies to assess separation of treatment groups
+col_num <- ifelse(treatment_ms == "post", 1, 2)
+par(mfrow = c(1, 3))
+EDASeq::plotPCA(tc,  k = 2, labels = FALSE, col = col_num, pch = 20, main = "PCA — TC")
+EDASeq::plotPCA(tmm, k = 2, labels = FALSE, col = col_num, pch = 20, main = "PCA — TMM")
+EDASeq::plotPCA(rle, k = 2, labels = FALSE, col = col_num, pch = 20, main = "PCA — RLE")
+par(mfrow = c(1, 1))
+legend("topright", legend = c("post", "pre"), col = c(1, 2), pch = 20)
+```
+
+---
+
+# Differential Expression Analysis
+
+## DESeq2
+
+```{r deseq2}
+# Build DESeq2 object from filtered raw counts, controlling for cell type
+data_ms$treatment <- factor(data_ms$treatment, levels = c("pre", "post"))
+
+dds <- DESeq2::DESeqDataSetFromMatrix(
+  countData = raw_count_ms,
+  colData   = colData(data_ms),
+  design    = ~ celltype + treatment
+)
+
+# Full DESeq2 pipeline:
+#   1. estimateSizeFactors  — depth normalization
+#   2. estimateDispersions  — gene-wise variance estimation
+#   3. nbinomWaldTest       — Wald test for significance
+dds <- DESeq(dds)
+
+# Extract results (post vs pre; pre is the reference level)
+res    <- results(dds)
+res_df <- as.data.frame(res)
+res_df$gene <- rownames(res_df)
+
+# Classify genes by significance and direction
+res_df$significance <- "Not significant"
+res_df$significance[res_df$padj < 0.05 & res_df$log2FoldChange >  1] <- "Upregulated"
+res_df$significance[res_df$padj < 0.05 & res_df$log2FoldChange < -1] <- "Downregulated"
+
+cat("DESeq2 results (FDR < 0.05, |log2FC| > 1):\n")
+cat("  Upregulated:  ", sum(res_df$significance == "Upregulated"),   "\n")
+cat("  Downregulated:", sum(res_df$significance == "Downregulated"), "\n")
+```
+
+## edgeR
+
+```{r edger}
+# Build edgeR DGEList from filtered raw counts
+y <- DGEList(raw_count_ms, group = data_ms$treatment)
+
+# Remove lowly expressed genes using the edgeR criterion
+keep_edger <- filterByExpr(y, group = data_ms$treatment)
+y <- y[keep_edger, , keep.lib.sizes = FALSE]
+
+# TMM normalization
+y <- calcNormFactors(y, method = "TMM")
+
+# Design matrix controlling for cell type (same covariates as DESeq2)
+design <- model.matrix(~ celltype + treatment, data = colData(data_ms))
+
+# Estimate dispersions and fit quasi-likelihood model
+y   <- estimateDisp(y, design)
+fit <- glmQLFit(y, design)
+
+# Test the treatment coefficient (post vs pre)
+qlf <- glmQLFTest(fit, coef = "treatmentpost")
+
+# Extract all results
+edgeR_res       <- topTags(qlf, n = Inf)$table
+edgeR_res$gene  <- rownames(edgeR_res)
+
+# Classify genes by significance and direction
+edgeR_res$significance <- "Not significant"
+edgeR_res$significance[edgeR_res$FDR < 0.05 & edgeR_res$logFC >  1] <- "Upregulated"
+edgeR_res$significance[edgeR_res$FDR < 0.05 & edgeR_res$logFC < -1] <- "Downregulated"
+
+cat("edgeR results (FDR < 0.05, |logFC| > 1):\n")
+cat("  Upregulated:  ", sum(edgeR_res$significance == "Upregulated"),   "\n")
+cat("  Downregulated:", sum(edgeR_res$significance == "Downregulated"), "\n")
+
+# Save edgeR results to file
+write.csv(edgeR_res, "edgeR_results.csv", row.names = FALSE)
+```
+
+DESeq2 identified 256 upregulated and 67 downregulated genes (FDR < 0.05,
+|log2FC| > 1) in post- vs pre-treatment MS samples, while edgeR identified 163
+upregulated and 0 downregulated genes under the same thresholds. The higher
+sensitivity of DESeq2 is consistent with its variance shrinkage approach.
+Genes significant in **both** methods are treated as the most robust DEGs for
+downstream analysis.
+
+## DESeq2–edgeR Overlap
+
+```{r overlap}
+# Identify genes significant in DESeq2 and/or edgeR
+deseq2_sig  <- res_df$gene[res_df$significance != "Not significant"]
+edger_sig   <- edgeR_res$gene[edgeR_res$significance != "Not significant"]
+
+shared_genes <- intersect(deseq2_sig, edger_sig)
+deseq2_only  <- setdiff(deseq2_sig, edger_sig)
+edger_only   <- setdiff(edger_sig, deseq2_sig)
+
+cat("Shared genes:  ", length(shared_genes), "\n")
+cat("DESeq2 only:   ", length(deseq2_only),  "\n")
+cat("edgeR only:    ", length(edger_only),   "\n")
+
+# Save gene lists
+write.csv(data.frame(gene = shared_genes), "shared_genes.csv",      row.names = FALSE)
+write.csv(data.frame(gene = deseq2_only),  "deseq2_only_genes.csv", row.names = FALSE)
+write.csv(data.frame(gene = edger_only),   "edger_only_genes.csv",  row.names = FALSE)
+```
+
+## Volcano Plots
+
+```{r volcano-plots}
+# DESeq2 volcano: log2FC on x, -log10(adjusted p-value) on y
+ggplot(res_df, aes(x = log2FoldChange, y = -log10(padj), color = significance)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = c("Upregulated"   = "purple",
+                                "Downregulated" = "steelblue",
+                                "Not significant" = "grey70")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  labs(title = "Volcano plot — DESeq2", x = "log2 fold change", y = "-log10(adj. p-value)") +
+  theme_bw()
+
+# edgeR volcano
+ggplot(edgeR_res, aes(x = logFC, y = -log10(FDR), color = significance)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = c("Upregulated"   = "purple",
+                                "Downregulated" = "steelblue",
+                                "Not significant" = "grey70")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  labs(title = "Volcano plot — edgeR", x = "logFC", y = "-log10(FDR)") +
+  theme_bw()
+
+```
+
+## Fold-Change Agreement (DESeq2 vs edgeR)
+
+```{r fc-scatter}
+# Merge results from both methods on the common gene column
+merged2 <- merge(
+  res_df[,    c("gene", "log2FoldChange", "padj", "significance")],
+  edgeR_res[, c("gene", "logFC", "FDR", "significance")],
+  by = "gene", suffixes = c("_DESeq2", "_edgeR")
+)
+colnames(merged2)[colnames(merged2) == "log2FoldChange"] <- "DESeq2_log2FC"
+colnames(merged2)[colnames(merged2) == "logFC"]          <- "edgeR_logFC"
+
+# Highlight genes significant in both methods
+shared_only <- subset(merged2,
+  significance_DESeq2 != "Not significant" &
+  significance_edgeR  != "Not significant")
+
+# Scatter plot: high concordance between methods is expected
+ggplot(merged2, aes(x = DESeq2_log2FC, y = edgeR_logFC)) +
+  geom_point(alpha = 0.4, size = 1.2, color = "grey50") +
+  geom_point(data = shared_only, aes(x = DESeq2_log2FC, y = edgeR_logFC),
+             color = "purple", alpha = 0.8, size = 1.5) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +
+  geom_smooth(method = "lm", se = FALSE, color = "blue", linewidth = 0.8) +
+  labs(title = "Fold-change agreement: DESeq2 vs edgeR",
+       x = "DESeq2 log2 fold change", y = "edgeR logFC") +
+  theme_bw()
+```
+
+## Shared DEG Table
+
+```{r shared-degs}
+# Build a merged table retaining only genes significant in BOTH methods
+deseq2_tbl <- res_df[, c("gene", "log2FoldChange", "padj", "significance")]
+colnames(deseq2_tbl) <- c("gene", "DESeq2_log2FC", "DESeq2_padj", "DESeq2_class")
+
+edger_tbl <- edgeR_res[, c("gene", "logFC", "FDR", "significance")]
+colnames(edger_tbl) <- c("gene", "edgeR_logFC", "edgeR_FDR", "edgeR_class")
+
+merged_results <- merge(deseq2_tbl, edger_tbl, by = "gene", all = FALSE)
+
+shared_results <- merged_results[
+  merged_results$DESeq2_class != "Not significant" &
+  merged_results$edgeR_class  != "Not significant", ]
+
+# Save merged and shared tables
+write.csv(merged_results, "merged_DESeq2_edgeR_results.csv", row.names = FALSE)
+write.csv(shared_results, "shared_DEGs_merged_table.csv",   row.names = FALSE)
+
+head(shared_results)
+```
+
+```{r direction-check}
+# Check whether fold-change directions agree between DESeq2 and edgeR
+shared_results$agreement <- ifelse(
+  sign(shared_results$DESeq2_log2FC) == sign(shared_results$edgeR_logFC),
+  "Same direction", "Different direction"
+)
+table(shared_results$agreement)
+```
+
+---
+
+# Heatmap of Top Shared DEGs
+
+```{r heatmap}
+# Select the top 40 shared DEGs by the smallest mean adjusted p-value
+shared_results$mean_padj <- rowMeans(
+  cbind(shared_results$DESeq2_padj, shared_results$edgeR_FDR), na.rm = TRUE
+)
+top_shared       <- shared_results[order(shared_results$mean_padj), ]
+top_shared_genes <- head(top_shared$gene, 40)
+
+# VST matrix from DESeq2 (blind = FALSE: uses design for dispersion estimation)
+vsd <- vst(dds, blind = FALSE)
+mat <- assay(vsd)[top_shared_genes, , drop = FALSE]
+
+# Z-score each gene row (mean = 0, sd = 1) so colours reflect relative change
+mat_scaled <- t(scale(t(mat)))
+
+# Column annotation for treatment group
+annotation_col <- data.frame(
+  Treatment = factor(treatment_ms, levels = c("pre", "post"))
+)
+rownames(annotation_col) <- colnames(mat_scaled)
+
+pheatmap(
+  mat_scaled,
+  annotation_col = annotation_col,
+  show_colnames  = FALSE,
+  fontsize_row   = 7,
+  cluster_rows   = TRUE,
+  cluster_cols   = TRUE,
+  color          = colorRampPalette(c("steelblue", "white", "purple"))(100),
+  main           = "Top 40 shared DEGs: DESeq2 and edgeR"
+)
+```
+
+---
+
+# Functional Enrichment Analysis
+
+## Gene ID Mapping
+
+```{r gene-id-mapping}
+# Shared significant genes will be used as the foreground set for ORA
+sign_genes    <- shared_results$gene
+universe_genes <- merged_results$gene
+
+# Strip Ensembl version suffixes (e.g. ENSG00000001234.5 -> ENSG00000001234)
+sign_clean    <- sub("\\..*", "", sign_genes)
+universe_clean <- sub("\\..*", "", universe_genes)
+
+# Map Ensembl IDs to Entrez IDs (required by KEGG and ReactomePA)
+sign.entrez <- mapIds(org.Hs.eg.db,
+                      keys    = sign_clean,
+                      column  = "ENTREZID",
+                      keytype = "ENSEMBL",
+                      multiVals = "first")
+
+universe.entrez <- mapIds(org.Hs.eg.db,
+                          keys    = universe_clean,
+                          column  = "ENTREZID",
+                          keytype = "ENSEMBL",
+                          multiVals = "first")
+
+# Remove NAs and deduplicate
+sign.entrez     <- unique(as.character(sign.entrez[!is.na(sign.entrez)]))
+universe.entrez <- unique(as.character(universe.entrez[!is.na(universe.entrez)]))
+```
+
+## Over-Representation Analysis (ORA)
+
+### KEGG ORA
+
+```{r kegg-ora}
+# KEGG pathway over-representation test (BH-corrected, FDR < 0.05)
+keg1 <- enrichKEGG(
+  gene         = sign.entrez,
+  universe     = universe.entrez,
+  organism     = "hsa",
+  keyType      = "ncbi-geneid",
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH"
+)
+
+barplot(keg1, showCategory = 10, title = "KEGG ORA — barplot")
+dotplot(keg1, showCategory = 10, title = "KEGG ORA — dotplot")
+```
+
+### Reactome ORA
+
+```{r reactome-ora}
+# Reactome pathway over-representation test
+enrich_reactome <- enrichPathway(
+  gene         = sign.entrez,
+  universe     = universe.entrez,
+  organism     = "human",
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH"
+)
+
+barplot(enrich_reactome, showCategory = 10, title = "Reactome ORA — barplot")
+dotplot(enrich_reactome, showCategory = 10, title = "Reactome ORA — dotplot")
+```
+
+### GO Biological Process ORA
+
+```{r go-ora}
+# GO Biological Process over-representation test
+enrich_ego <- enrichGO(
+  gene         = sign.entrez,
+  universe     = universe.entrez,
+  OrgDb        = org.Hs.eg.db,
+  keyType      = "ENTREZID",
+  ont          = "BP",
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  readable     = TRUE   # converts Entrez IDs to gene symbols in output
+)
+
+barplot(enrich_ego, showCategory = 10, title = "GO Biological Process ORA — barplot")
+dotplot(enrich_ego, showCategory = 10, title = "GO Biological Process ORA — dotplot")
+```
+
+## Gene Set Enrichment Analysis (GSEA)
+
+```{r gsea-ranklist}
+# Build a ranked gene list from DESeq2 log2 fold changes (all genes, not just DEGs)
+# Ranking by log2FC ensures the most strongly changed genes anchor each tail
+deseq2_gsea            <- res_df[!is.na(res_df$log2FoldChange), ]
+deseq2_gsea$gene_clean <- sub("\\..*", "", deseq2_gsea$gene)
+
+deseq2_gsea$entrez <- mapIds(org.Hs.eg.db,
+                             keys    = deseq2_gsea$gene_clean,
+                             column  = "ENTREZID",
+                             keytype = "ENSEMBL",
+                             multiVals = "first")
+
+# Remove unmapped and duplicated entries
+deseq2_gsea <- deseq2_gsea[!is.na(deseq2_gsea$entrez), ]
+deseq2_gsea <- deseq2_gsea[!duplicated(deseq2_gsea$entrez), ]
+
+# Named, sorted vector of log2FC values (descending) for GSEA input
+tt           <- deseq2_gsea$log2FoldChange
+names(tt)    <- deseq2_gsea$entrez
+tt           <- sort(tt, decreasing = TRUE)
+```
+
+### KEGG GSEA
+
+```{r kegg-gsea}
+kk_gsea <- gseKEGG(
+  geneList      = tt,
+  organism      = "hsa",
+  keyType       = "ncbi-geneid",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH",
+  verbose       = FALSE
+)
+
+ridgeplot(kk_gsea, showCategory = 15, label_format = 50)
+gseaplot(kk_gsea, geneSetID = 1, title = kk_gsea$Description[1])
+```
+
+### Reactome GSEA
+
+```{r reactome-gsea}
+reactome_gsea <- gsePathway(
+  geneList      = tt,
+  organism      = "human",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH",
+  verbose       = FALSE
+)
+
+dotplot(reactome_gsea, showCategory = 10, title = "GSEA — Reactome")
+gseaplot(reactome_gsea, geneSetID = 1, title = reactome_gsea$Description[1])
+```
+
+### GO Biological Process GSEA
+
+```{r go-gsea}
+go_gsea <- gseGO(
+  geneList      = tt,
+  ont           = "BP",
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH",
+  verbose       = FALSE
+)
+
+dotplot(go_gsea, showCategory = 10, title = "GSEA — GO Biological Process")
+gseaplot(go_gsea, geneSetID = 1, title = go_gsea$Description[1])
+```
+
+---
+
+# Summary Tables of Top Enriched Terms
+
+```{r top-terms}
+# Extract the top 10 terms from each ORA method, ordered by adjusted p-value.
+# These results are used to contextualise findings relative to the original paper.
+
+kegg_top <- as.data.frame(keg1) %>%
+  dplyr::arrange(p.adjust) %>%
+  dplyr::select(ID, Description, GeneRatio, Count, p.adjust) %>%
+  head(10)
+
+reactome_top <- as.data.frame(enrich_reactome) %>%
+  dplyr::arrange(p.adjust) %>%
+  dplyr::select(ID, Description, GeneRatio, Count, p.adjust) %>%
+  head(10)
+
+go_top <- as.data.frame(enrich_ego) %>%
+  dplyr::arrange(p.adjust) %>%
+  dplyr::select(ID, Description, GeneRatio, Count, p.adjust) %>%
+  head(10)
+
+cat("=== Top 10 KEGG terms ===\n");    print(kegg_top)
+cat("\n=== Top 10 Reactome terms ===\n"); print(reactome_top)
+cat("\n=== Top 10 GO-BP terms ===\n");   print(go_top)
+```
+
+```{r combined-table}
+# Combined table of all top enrichment results for comparison with the literature
+all_top_terms <- bind_rows(
+  mutate(kegg_top,     source = "KEGG"),
+  mutate(reactome_top, source = "Reactome"),
+  mutate(go_top,       source = "GO-BP")
+)
+print(all_top_terms)
+```
+
+---
+
+*End of analysis.*
